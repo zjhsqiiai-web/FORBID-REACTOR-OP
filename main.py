@@ -3,7 +3,6 @@ import asyncio
 import logging
 import time
 
-import aiohttp
 from aiohttp import web
 import discord
 
@@ -25,51 +24,11 @@ client = discord.Client(
     guild_subscriptions=False,
 )
 
-# ── Byte counter (just logs, no cap enforced — see note at bottom) ──
-BYTES = {"in": 0, "out": 0}
-_start = time.time()
+# ── Simple counters for /stats (approximate bandwidth estimate) ──
+STATS = {"seen": 0, "reacted": 0, "queued": 0, "dropped": 0}
+START = time.time()
 
-# ── Patch aiohttp to count REST bytes ──
-_orig_session_init = aiohttp.ClientSession.__init__
-def _patched_init(self, *a, **kw):
-    kw.setdefault("trace_configs", []).append(_trace())
-    _orig_session_init(self, *a, **kw)
-aiohttp.ClientSession.__init__ = _patched_init
-
-def _trace():
-    tc = aiohttp.TraceConfig()
-    async def start(s, ctx, p):
-        ctx.req = len(p.method) + len(str(p.url))
-        ctx.resp = 0
-    async def req_chunk(s, ctx, p):
-        ctx.req += len(p.chunk)
-    async def resp_chunk(s, ctx, p):
-        ctx.resp += len(p.chunk)
-    async def end(s, ctx, p):
-        BYTES["out"] += ctx.req
-        BYTES["in"] += ctx.resp
-    tc.on_request_start.append(start)
-    tc.on_request_chunk_sent.append(req_chunk)
-    tc.on_response_chunk_received.append(resp_chunk)
-    tc.on_request_end.append(end)
-    return tc
-
-# ── Patch WebSocket to count gateway bytes ──
-_orig_recv = aiohttp.ClientWebSocketResponse.receive
-async def _recv(self, *a, **kw):
-    msg = await _orig_recv(self, *a, **kw)
-    if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
-        BYTES["in"] += len(msg.data)
-    return msg
-aiohttp.ClientWebSocketResponse.receive = _recv
-
-_orig_send = aiohttp.ClientWebSocketResponse.send_str
-async def _send(self, data, *a, **kw):
-    BYTES["out"] += len(data)
-    return await _orig_send(self, data, *a, **kw)
-aiohttp.ClientWebSocketResponse.send_str = _send
-
-# ── Reaction queue per channel (keeps us from spamming Discord) ──
+# ── Per-channel queues so we never fire 6 reactions at once ──
 _queues: dict[int, asyncio.Queue] = {}
 _workers: dict[int, asyncio.Task] = {}
 
@@ -80,7 +39,8 @@ async def _worker(channel_id: int):
         for emoji in LETTERS:
             try:
                 await msg.add_reaction(emoji)
-                await asyncio.sleep(1.0)  # Discord: 1 reaction/sec/channel
+                STATS["reacted"] += 1
+                await asyncio.sleep(1.0)  # 1 react/sec/channel — Discord safe
             except discord.HTTPException as e:
                 if getattr(e, "status", None) == 429:
                     await asyncio.sleep(float(getattr(e, "retry_after", 5.0)) + 0.5)
@@ -97,8 +57,9 @@ def _enqueue(message: discord.Message):
         _workers[cid] = asyncio.create_task(_worker(cid))
     try:
         _queues[cid].put_nowait(message)
+        STATS["queued"] += 1
     except asyncio.QueueFull:
-        pass
+        STATS["dropped"] += 1
 
 @client.event
 async def on_ready():
@@ -110,6 +71,7 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
+    STATS["seen"] += 1
     if message.author.id == client.user.id:
         return
     if message.guild is None:
@@ -118,25 +80,29 @@ async def on_message(message: discord.Message):
         return
     _enqueue(message)
 
-# ── Health server for Render ──
+# ── Health + stats server ──
 async def health():
     app = web.Application()
+
     async def ok(_r):
         return web.Response(text="ok", headers={"Cache-Control": "no-store"})
+
     async def stats(_r):
-        up = (time.time() - _start) / 3600
-        total = BYTES["in"] + BYTES["out"]
-        est_month = (total / max(up, 0.01) * 720) / 1e9
+        up_h = (time.time() - START) / 3600
+        # ~5 KB per reacted message (gateway event + 6 REST calls)
+        est_month_gb = (STATS["reacted"] / max(up_h, 0.01) * 720 * 5000) / 1e9
         return web.Response(
             text=(
-                f"uptime={up:.2f}h "
-                f"total={total/1e6:.2f}MB "
-                f"est_month={est_month:.2f}GB "
-                f"gw_in={BYTES['in']/1e6:.2f}MB "
-                f"rest_out={BYTES['out']/1e6:.2f}MB"
+                f"uptime={up_h:.2f}h "
+                f"seen={STATS['seen']} "
+                f"reacted={STATS['reacted']} "
+                f"queued={STATS['queued']} "
+                f"dropped={STATS['dropped']} "
+                f"est_month={est_month_gb:.2f}GB"
             ),
             headers={"Cache-Control": "no-store"},
         )
+
     app.router.add_get("/", ok)
     app.router.add_get("/healthz", ok)
     app.router.add_get("/stats", stats)
